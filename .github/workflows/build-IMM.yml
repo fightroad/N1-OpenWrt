@@ -14,6 +14,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-22.04
+    timeout-minutes: 480  # 延长编译超时时间至8小时，避免中途中断
 
     steps:
     - name: Check machine configuration
@@ -82,7 +83,12 @@ jobs:
         
     - name: Checkout
       uses: actions/checkout@main
-      
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.22'
+
     - name: Initialize environment
       env:
         DEBIAN_FRONTEND: noninteractive
@@ -133,15 +139,43 @@ jobs:
         find dl -size -1024c -exec rm -f {} \;
 
     - name: Compile the firmware
+      id: compile
       run: |
+        # 提升文件描述符限制，避免编译过程中文件打开过多报错
+        ulimit -n 65535
         chmod -R 755 openwrt
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
-        echo "compile_status=success" >> $GITHUB_ENV
+        # 优化编译线程：预留1核，避免资源耗尽
+        CORE_COUNT=$((`nproc` - 1))
+        if [ $CORE_COUNT -lt 1 ]; then CORE_COUNT=1; fi
+        echo "使用 $CORE_COUNT 线程编译（总核心数：`nproc`）"
+        
+        # 预检查编译依赖，提前发现缺失依赖
+        make prereq > /tmp/prereq.log 2>&1
+        if [ $? -ne 0 ]; then
+          echo "编译依赖检查失败，日志如下："
+          cat /tmp/prereq.log
+          exit 1
+        fi
+        
+        # 分阶段编译：多线程 → 单线程 → 详细日志单线程
+        make -j$CORE_COUNT || \
+        (echo "多线程编译失败，切换单线程重试..." && make -j1) || \
+        (echo "单线程编译仍失败，生成详细日志..." && make -j1 V=s 2>&1 | tee /tmp/compile_error.log && exit 1)
+
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    # 新增：编译失败时上传错误日志，便于排查
+    - name: Upload compile error log (if failed)
+      if: steps.compile.outcome == 'failure'
+      uses: actions/upload-artifact@v4
+      with:
+        name: compile-error-log
+        path: /tmp/compile_error.log
+        retention-days: 7
 
     - name: Package OpenWrt Firmware
-      if: ${{ env.compile_status }} == 'success' && !cancelled()
+      if: ${{ steps.compile.outputs.status == 'success' && !cancelled() && steps.compile.outcome == 'success' }}
       uses: unifreq/openwrt_packit@master
       env:
         OPENWRT_ARMVIRT: openwrt/bin/targets/*/*/immortalwrt-armsr-armv8-generic-rootfs.tar.gz
@@ -151,12 +185,23 @@ jobs:
         WHOAMI: fightroad
         SW_FLOWOFFLOAD: 0
         SFE_FLOW: 0
+      id: pack
+
+    - name: Resolve release tag date
+      id: tagmeta
+      if: ${{ steps.pack.outcome == 'success' && !cancelled() }}
+      run: |
+        if [ -n "${PACKAGED_OUTPUTDATE}" ]; then
+          echo "output_date=${PACKAGED_OUTPUTDATE}" >> $GITHUB_OUTPUT
+        else
+          echo "output_date=$(date +%Y.%m.%d-%H%M)" >> $GITHUB_OUTPUT
+        fi
        
     - name: Upload OpenWrt Firmware to Release
       uses: ncipollo/release-action@main
-      if: ${{ env.PACKAGED_STATUS == 'success' }} && !cancelled()
+      if: ${{ steps.pack.outcome == 'success' && steps.compile.outputs.status == 'success' && !cancelled() }}
       with:
-        tag: immortalwrt_N1_${{ env.PACKAGED_OUTPUTDATE }}
+        tag: immortalwrt_N1_${{ steps.tagmeta.outputs.output_date }}
         artifacts: /opt/openwrt_packit/output/*
         allowUpdates: true
         token: ${{ secrets.GITHUB_TOKEN }}
